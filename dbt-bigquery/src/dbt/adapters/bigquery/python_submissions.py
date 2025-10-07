@@ -1,6 +1,7 @@
 import inspect
 import json
 import re
+import time
 from typing import Any, Dict, Optional, Union
 import uuid
 
@@ -10,6 +11,7 @@ from dbt.adapters.bigquery.clients import (
     create_dataproc_batch_controller_client,
     create_dataproc_job_controller_client,
     create_gcs_client,
+    create_notebook_client,
 )
 from dbt.adapters.bigquery.credentials import (
     BigQueryConnectionMethod,
@@ -19,8 +21,8 @@ from dbt.adapters.bigquery.credentials import (
 from dbt.adapters.bigquery.retry import RetryFactory
 from dbt.adapters.events.logging import AdapterLogger
 from dbt_common.exceptions import DbtRuntimeError
-from google.api_core.client_options import ClientOptions
 
+from google.api_core.operation import Operation
 from google.auth.transport.requests import Request
 from google.cloud import aiplatform_v1
 from google.cloud.aiplatform import gapic as aiplatform_gapic
@@ -38,6 +40,13 @@ _logger = AdapterLogger("BigQuery")
 _NETWORK_NAME = "default"
 _SUBNETWORK_NAME = "default"
 _DEFAULT_JAR_FILE_URI = "gs://spark-lib/bigquery/spark-bigquery-with-dependencies_2.13-0.34.0.jar"
+# For BigFrames models, the default timeout is set to 1 hour (60 * 60 seconds).
+# This differs from other Python models because the typical 5-minute timeout
+# is insufficient for BigFrames processing.
+_DEFAULT_BIGFRAMES_TIMEOUT = 60 * 60
+# Time interval in seconds between successive polling attempts to check the
+# notebook job's status in BigFrames mode.
+_COLAB_POLL_INTERVAL = 10
 
 
 class _BigQueryPythonHelper(PythonJobHelper):
@@ -197,14 +206,13 @@ class BigFramesHelper(_BigQueryPythonHelper):
         self._model_name = parsed_model["alias"]
         self._connection_method = credentials.method
         self._GoogleCredentials = create_google_credentials(credentials)
-
-        # TODO(jialuo): Add a function in clients.py for it.
-        self._ai_platform_client = aiplatform_v1.NotebookServiceClient(
-            credentials=self._GoogleCredentials,
-            client_options=ClientOptions(api_endpoint=f"{self._region}-aiplatform.googleapis.com"),
-        )
+        self._notebook_client = create_notebook_client(self._GoogleCredentials, self._region)
         self._notebook_template_id = parsed_model["config"].get("notebook_template_id")
         self._packages = parsed_model["config"].get("packages", [])
+        retry = RetryFactory(credentials)
+        self._polling_retry = retry.create_polling(
+            model_timeout=parsed_model["config"].get("timeout") or _DEFAULT_BIGFRAMES_TIMEOUT
+        )
 
     def _py_to_ipynb(self, compiled_code: str) -> str:
         notebook = nbformat.v4.new_notebook()
@@ -223,7 +231,7 @@ class BigFramesHelper(_BigQueryPythonHelper):
             parent=f"projects/{self._project}/locations/{self._region}",
             filter="notebookRuntimeType = ONE_CLICK",
         )
-        page_result = self._ai_platform_client.list_notebook_runtime_templates(request=request)
+        page_result = self._notebook_client.list_notebook_runtime_templates(request=request)
 
         try:
             # Check if a default runtime template is available and applicable.
@@ -272,9 +280,7 @@ class BigFramesHelper(_BigQueryPythonHelper):
             notebook_runtime_template=template,
         )
 
-        operation = self._ai_platform_client.create_notebook_runtime_template(
-            request=create_request
-        )
+        operation = self._notebook_client.create_notebook_runtime_template(request=create_request)
         response = operation.result()
 
         return self._extract_template_id(response.name)
@@ -414,6 +420,33 @@ class BigFramesHelper(_BigQueryPythonHelper):
 
         self._submit_bigframes_job(notebook_template_id)
 
+    def _track_notebook_job_status(self, job_name: str) -> aiplatform_v1.NotebookExecutionJob:
+        """Tracks the notebook job until it completes or times out."""
+        max_wait_time = self._polling_retry.timeout
+        elapsed = 0
+
+        while True:
+            retrieved_job = self._notebook_client.get_notebook_execution_job(name=job_name)
+            job_state = retrieved_job.job_state
+            print('---------------------------')
+            print(f"Notebook job status: {job_state.name} (elapsed: {elapsed} s)")
+
+            if job_state in (
+                aiplatform_gapic.JobState.JOB_STATE_SUCCEEDED,
+                aiplatform_gapic.JobState.JOB_STATE_FAILED,
+            ):
+                return retrieved_job
+            elif elapsed >= max_wait_time:
+                raise TimeoutError(
+                    "Operation did not complete within the designated timeout "
+                    f"of {max_wait_time} seconds. Please cancel the related "
+                    "notebook job manually via the GCP console since it might "
+                    "still be actively running."
+                )
+
+            time.sleep(_COLAB_POLL_INTERVAL)
+            elapsed += _COLAB_POLL_INTERVAL
+
     def _submit_bigframes_job(
         self, notebook_template_id: str
     ) -> aiplatform_v1.NotebookExecutionJob:
@@ -426,33 +459,34 @@ class BigFramesHelper(_BigQueryPythonHelper):
         )
 
         try:
-            res = self._ai_platform_client.create_notebook_execution_job(request=request).result(
-                timeout=self._polling_retry.timeout
-            )
-            retrieved_job = self._ai_platform_client.get_notebook_execution_job(name=res.name)
+            operation: Operation = self._notebook_client.create_notebook_execution_job(request=request)
+            lro_name = operation.operation.name
+            job_name = lro_name.split('/operations/')[0]
+            retrieved_job = self._track_notebook_job_status(job_name)
         except TimeoutError as timeout_error:
             raise TimeoutError(
-                f"The dbt operation encountered a timeout: {timeout_error}\n"
-                "Please cancel the related notebook job manually via the GCP "
-                "console since it might still be actively running."
+                f"The dbt operation encountered a timeout: {timeout_error}"
             )
         except Exception as e:
             raise DbtRuntimeError(f"An unexpected error occured while executing the notebook: {e}")
 
-        job_id = res.name.split("/")[-1]
+        job_id = job_name.split("/")[-1]
         gcs_log_uri = f"{notebook_execution_job.gcs_output_uri}/{job_id}/{self._model_name}.py"
         self._process_gcs_log(gcs_log_uri)
 
-        if retrieved_job.job_state == aiplatform_gapic.JobState.JOB_STATE_FAILED:
+        if retrieved_job.job_state == aiplatform_gapic.JobState.JOB_STATE_SUCCEEDED:
+            _logger.info("Colab notebook execution finished successfully.")
+        elif retrieved_job.job_state == aiplatform_gapic.JobState.JOB_STATE_FAILED:
             raise DbtRuntimeError(
                 f"The colab notebook execution job '{retrieved_job.name}' failed."
             )
-        elif retrieved_job.job_state != aiplatform_gapic.JobState.JOB_STATE_SUCCEEDED:
+        else:
             raise DbtRuntimeError(
-                f"The colab notebook execution job '{retrieved_job.name}' finished with unexpected state: {retrieved_job.job_state.name}"
+                f"The colab notebook execution job '{retrieved_job.name}' "
+                "finished with unexpected state: {retrieved_job.job_state.name}"
             )
 
-        return self._ai_platform_client.get_notebook_execution_job(name=res.name)
+        return self._notebook_client.get_notebook_execution_job(name=job_name)
 
 
 def _install_packages(packages: list[str]) -> None:
